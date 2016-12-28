@@ -1,0 +1,3 @@
+night: Good night, sweet dreams.
+
+morning: Good morning! You slept for {{ numbers }} seconds.
