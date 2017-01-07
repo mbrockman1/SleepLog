@@ -1,104 +1,182 @@
-import sqlite3
+import boto3
 import time
+from decimal import Decimal
 import logging
 from flask import Flask, render_template
 from flask_ask import Ask, statement, question, session
 
-'''
-Nachos
-'''
-
-table_name = 'sleep_wake_table'
-id_column = 'ID'
-ID_col_type = 'INTEGER'
-sleep_column = 'sleep'
-column_type = 'REAL'
-default_val = "Null"
-field_type = 'REAL'
-wake_column = 'wake'
-diff_column = 'diff'
-time_db = sqlite3.connect('time.db', check_same_thread=False)
-db_cursor = time_db.cursor()
-
 app = Flask(__name__)
 ask = Ask(app, "/")
 
+# Create Table
+
+# Get the service resource.
+dynamodb =\
+    boto3.resource('dynamodb',
+                   region_name='us-east-2',
+                   endpoint_url="https://dynamodb.us-east-2.amazonaws.com")
+
 try:
-    db_cursor.execute('CREATE TABLE {tn} ({nf} {ft} PRIMARY KEY)'
-                      .format(tn=table_name, nf=id_column, ft=ID_col_type))
-    db_cursor.execute("ALTER TABLE {tn} ADD COLUMN '{cn}' {ct} DEFAULT '{df}'"
-                      .format(tn=table_name, cn=sleep_column, ct=column_type,
-                              df=default_val))
-    db_cursor.execute("ALTER TABLE {tn} ADD COLUMN '{cn}' {ct} DEFAULT '{df}'"
-                      .format(tn=table_name, cn=wake_column, ct=column_type,
-                              df=default_val))
-    db_cursor.execute("ALTER TABLE {tn} ADD COLUMN '{cn}' {ct} DEFAULT '{df}'"
-                      .format(tn=table_name, cn=diff_column, ct=column_type,
-                              df=default_val))
-    time_db.commit()
+    # Create the DynamoDB table.
+    table = dynamodb.create_table(
+        TableName='sleep_wake_table',
+        KeySchema=[
+            {
+                'AttributeName': 'id',
+                'KeyType': 'HASH'
+            },
+            {
+                'AttributeName': 'id_2',
+                'KeyType': 'RANGE'
+            }
+        ],
+        AttributeDefinitions=[
+            {
+                'AttributeName': 'id',
+                'AttributeType': 'N'
+            },
+            {
+                'AttributeName': 'id_2',
+                'AttributeType': 'N'
+            },
+
+        ],
+        ProvisionedThroughput={
+            'ReadCapacityUnits': 5,
+            'WriteCapacityUnits': 5
+        }
+    )
+    # Wait until the table exists.
+    table.meta.client.get_waiter(
+        'table_exists').wait(TableName='sleep_wake_table')
 except:
-    pass
+    # Connect if already created
+    dynamodb = boto3.resource('dynamodb')
+    table = dynamodb.Table('sleep_wake_table')
 
 logging.getLogger("flask_ask").setLevel(logging.DEBUG)
 
 
-def _delete_null_vals():
-    db_cursor.execute('DELETE FROM {tn} WHERE {cn} = "Null"'
-                      .format(tn=table_name, cn=wake_column))
-    time_db.commit()
+def _check_if_last_val_has_none(id_num):
+    # check if values contain 0, then delete
+    try:
+        response = table.get_item(
+            Key={
+                'id': id_num,
+                'id_2': id_num
+            }
+        )
+        if response['Item']['wake_time'] == 0:
+            table.delete_item(
+                Key={
+                    'id': id_num,
+                    'id_2': id_num
+                }
+            )
+    except:
+        pass
 
 
-def how_many_rows():
-    db_cursor.execute('SELECT * FROM {tn}'
-                      .format(tn=table_name))
-    list_of_items = db_cursor.fetchall()
-    print list_of_items
-    return len(list_of_items)
-
-
-def _diff_time(last_val):
-    db_cursor.execute('SELECT * FROM {tn} ORDER BY {id} DESC LIMIT 1'
-                      .format(tn=table_name, id=id_column))
-    list_of_items = db_cursor.fetchone()
-    diff = list_of_items[2] - list_of_items[1]
-    db_cursor.execute('UPDATE {tn} SET {cn}={sleep_time} WHERE {id}={last}'
-                      .format(tn=table_name, cn=diff_column, sleep_time=diff,
-                              id=id_column, last=last_val))
-    time_db.commit()
-    return diff
-
-
-def return_last_id_value():
-    db_cursor.execute('SELECT * FROM {tn} ORDER BY {idf} DESC LIMIT 1'
-                      .format(tn=table_name, idf=id_column))
-    list_of_items = db_cursor.fetchone()
-    return list_of_items[0]
+def _add_diff_time(id_num):
+    response = table.get_item(
+        Key={
+            'id': id_num,
+            'id_2': id_num
+        }
+    )
+    wake_time = response['Item']['wake_time']
+    sleep_time = response['Item']['sleep_time']
+    diff_time = wake_time - sleep_time
+    table.update_item(
+        Key={
+            'id': id_num,
+            'id_2': id_num
+        },
+        UpdateExpression='SET diff_time = :val1',
+        ExpressionAttributeValues={
+            ':val1': Decimal(diff_time)
+        }
+    )
+    return diff_time
 
 
 @ask.intent("SleepIntent")
 def go_to_bed_insertion():
-    _delete_null_vals()
-    db_cursor.execute("INSERT OR IGNORE INTO {tn} ({id}, {cn}) VALUES ({id_num}, {sleep_time})"
-                      .format(tn=table_name, id=id_column, cn=sleep_column,
-                              id_num=how_many_rows(), sleep_time=time.time()))
-    time_db.commit()
+    id_num = table.scan()['Count']
+    _check_if_last_val_has_none(id_num - 1)
+    # Create Item
+    table.put_item(
+        Item={
+            'id': id_num,
+            'id_2': id_num,
+            'sleep_time': Decimal(time.time()),
+            'wake_time': Decimal(0),
+            'diff_time': Decimal(0)
+        }
+    )
     night_msg = render_template('night')
     return statement(night_msg)
 
 
+def _second_converter(return_time):
+    minute, second = divmod(return_time, 60)
+    hour, minute = divmod(minute, 60)
+    hour_phrase = ""
+    minute_phrase = ""
+    second_phrase = ""
+
+    if hour == 1:
+        hour_phrase = "%d hour" % (hour)
+    elif hour > 1:
+        hour_phrase = "%d hours" % (hour)
+    else:
+        pass
+    if minute == 1:
+        minute_phrase = "%d minute" % (minute)
+    elif minute > 1:
+        minute_phrase = "%d minutes" % (minute)
+    else:
+        pass
+    if second == 1:
+        second_phrase = "%d second" % (int(round(second)))
+    elif second > 1:
+        second_phrase = "%d seconds" % (int(round(second)))
+    else:
+        pass
+
+    if hour_phrase + minute_phrase != "":
+        return hour_phrase + minute_phrase
+    else:
+        return second_phrase
+
+
 @ask.intent("WakeIntent")
 def wake_up_insertion():
-    last_val = return_last_id_value()
-    db_cursor.execute('UPDATE {tn} SET {cn}={sleep_time} WHERE {id}={last}'
-                      .format(tn=table_name, cn=wake_column,
-                              sleep_time=time.time(), id=id_column,
-                              last=last_val))
-    sleep_wake_differential = _diff_time(last_val)
-    # import pdb
-    # pdb.set_trace()
-    time_db.commit()
+    id_num = table.scan()['Count'] - 1
+    response = table.get_item(
+        Key={
+            'id': id_num,
+            'id_2': id_num
+            }
+        )
+    if Decimal(time.time()) - response['Item']['sleep_time'] < 61200:
+        # Update Attributes of item
+        table.update_item(
+            Key={
+                'id': id_num,
+                'id_2': id_num
+            },
+            UpdateExpression='SET wake_time = :val1',
+            ExpressionAttributeValues={
+                ':val1': Decimal(time.time())
+            }
+        )
+    else:
+        pass
+    sleep_wake_differential = _add_diff_time(id_num)
+    adjusted_time = _second_converter(sleep_wake_differential)
     morning_msg = render_template(
-        'morning', numbers=int(sleep_wake_differential))
+        'morning', time_string=adjusted_time)
     return statement(morning_msg)
 
 if __name__ == '__main__':
